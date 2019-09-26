@@ -12,9 +12,11 @@
 #include <chain_nodes/alsa_collector_node.h>
 #include <chain_nodes/vep_aec_beamforming_node.h>
 #include <chain_nodes/snowboy_1b_doa_kws_node.h>
+#include <chain_nodes/snips_1b_doa_kws_node.h>
 
 
 #include "json.hpp"
+#include "toml.h"
 
 extern "C"
 {
@@ -37,11 +39,10 @@ const char *hotword_model_path = "./hotword_models/";
 
 std::vector<std::string> hotword_models = {
     "Olga_Chris.pmdl",
-    "snowboy.umdl",
-    "computer.umdl",
-    "jarvis.umdl",
-    "alexa_02092017.umdl",
-    "OK_Google.pmdl"
+    //"snowboy.umdl",
+    //"computer.umdl",
+    "alexa_02092017.umdl"
+    //"OK_Google.pmdl"
 };
 
 using namespace std;
@@ -56,6 +57,92 @@ bool enable_agc = false;
 int agc_level = 10;
 string mic_type;
 string siteid = "default";
+string mqttHost = "localhost";
+int mqttPort = 1883;
+
+std::vector<std::string> stringSplit(const std::string& s, char seperator)
+{
+   std::vector<std::string> output;
+
+    std::string::size_type prev_pos = 0, pos = 0;
+
+    while((pos = s.find(seperator, pos)) != std::string::npos)
+    {
+        std::string substring( s.substr(prev_pos, pos-prev_pos) );
+
+        output.push_back(substring);
+
+        prev_pos = ++pos;
+    }
+
+    output.push_back(s.substr(prev_pos, pos-prev_pos)); // Last word
+
+    return output;
+}
+
+void hexDump(const void *data, const size_t size)
+{
+    /* dumps size bytes of *data to stdout. Looks like:
+     * [0000] 75 6E 6B 6E 6F 77 6E 20
+     *                  30 FF 00 00 00 00 39 00 unknown 0.....9.
+     * (in a single line of course)
+     */
+
+    unsigned char *p = (unsigned char*)data;
+    unsigned char c;
+    unsigned int n;
+    char bytestr[10] = {0};
+    char addrstr[10] = {0};
+    char hexstr[ 16*10 + 5] = {0};
+    char charstr[16*1 + 5] = {0};
+
+    for(n=1;n<=size;n++) {
+        if (n%16 == 1) {
+            /* store address for this line */
+            snprintf(addrstr, sizeof(addrstr), "%.4x", (unsigned int)(p-(unsigned char*)data) );
+        }
+
+        c = *p;
+        if (isalnum(c) == 0) {
+            c = '.';
+        }
+
+        /* store hex str (for left side) */
+        snprintf(bytestr, sizeof(bytestr), "%02X ", *p);
+        strncat(hexstr, bytestr, sizeof(hexstr)-strlen(hexstr)-1);
+
+        /* store char str (for right side) */
+        snprintf(bytestr, sizeof(bytestr), "%c", c);
+        strncat(charstr, bytestr, sizeof(charstr)-strlen(charstr)-1);
+
+        if(n%16 == 0)
+        {
+            /* line completed */
+            printf("[%4.4s]   %-50.50s  %s\n", addrstr, hexstr, charstr);
+
+            hexstr[0] = 0;
+            charstr[0] = 0;
+        }
+        else if(n%8 == 0)
+        {
+            /* half line: add whitespaces */
+            strncat(hexstr, "  ", sizeof(hexstr)-strlen(hexstr)-1);
+            strncat(charstr, " ", sizeof(charstr)-strlen(charstr)-1);
+        }
+        p++; /* next byte */
+    }
+
+    if (strlen(hexstr) > 0)
+    {
+        /* print rest of buffer if not empty */
+        printf("[%4.4s]   %-50.50s  %s\n", addrstr, hexstr, charstr);
+    }
+}
+
+uint64_t timeSinceEpochMillisec() {
+  using namespace std::chrono;
+  return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
 
 bool caseInSensStringCompareCpp11(std::string & str1, std::string &str2)
 {
@@ -295,7 +382,7 @@ static void help(const char *argv0) {
     cout << "  -s, --source=SOURCE_NAME                 The alsa source (microphone) to connect to" << endl;
     cout << "  -t, --type=MIC_TYPE                      The MICROPHONE TYPE, support: CIRCULAR_6MIC_7BEAM, LINEAR_6MIC_8BEAM, LINEAR_4MIC_1BEAM, CIRCULAR_4MIC_9BEAM" << endl;
     cout << "  -g, --agc=NEGTIVE INTEGER                The target gain level of output, [-31, 0]" << endl;
-    cout << "      --siteid=SITE_ID                     The Snips site id" << endl;
+    //cout << "      --siteid=SITE_ID                     The Snips site id" << endl;
 }
 
 int main(int argc, char *argv[])
@@ -315,7 +402,7 @@ int main(int argc, char *argv[])
         {"source",       1, NULL, 's'},
         {"type",         1, NULL, 't'},
         {"agc",          1, NULL, 'g'},
-        {"siteid",       1, NULL, 1000},
+        //{"siteid",       1, NULL, 1000},
         {NULL,           0, NULL,  0}
     };
 
@@ -336,11 +423,41 @@ int main(int argc, char *argv[])
             if ((agc_level > 31) || (agc_level < -31)) agc_level = 31;
             if (agc_level < 0) agc_level = (0-agc_level);
             break;
-        case 1000:
+        /*case 1000:
             siteid = string(optarg);
-            break;
+            break;*/
         default:
             return 0;
+        }
+    }
+
+    //load the snips config file so we can pull out any of the details in it we need
+    std::ifstream ifs("/etc/snips.toml");
+    toml::ParseResult pr = toml::parse(ifs);
+
+    if (pr.valid())
+    {
+        const toml::Value& parsedValues = pr.value;
+
+        const toml::Value* mqttSettingString = parsedValues.find("snips-common.mqtt");
+        if (mqttSettingString && mqttSettingString->is<std::string>())
+        {
+            std::vector<std::string> splitMQTTDetails = stringSplit(mqttSettingString->as<std::string>(), ':');
+            if (splitMQTTDetails.size() == 2)
+            {
+                mqttHost = splitMQTTDetails[0];
+                mqttPort = atoi(splitMQTTDetails[1].c_str());
+            }
+        }
+
+        const toml::Value* audioBindString = parsedValues.find("snips-audio-server.bind");
+        if (audioBindString && audioBindString->is<std::string>())
+        {
+            std::vector<std::string> splitAudioBindOptions = stringSplit(audioBindString->as<std::string>(), '@');
+            if (splitAudioBindOptions.size() == 2)
+            {
+                siteid = splitAudioBindOptions[0];
+            }
         }
     }
 
@@ -360,6 +477,9 @@ int main(int argc, char *argv[])
     struct mosquitto *mosq = NULL;
     bool clean_session = true;
 
+    printf("Connecting to MQTT server: %s:%d\n", mqttHost.c_str(), mqttPort);
+    printf("Using siteid: %s\n", siteid.c_str());
+
 	mosquitto_lib_init();
     mosq = mosquitto_new(NULL, clean_session, NULL);
 	if(!mosq){
@@ -372,7 +492,7 @@ int main(int argc, char *argv[])
 	mosquitto_message_callback_set(mosq, mqtt_message_callback);
 	//mosquitto_subscribe_callback_set(mosq, mqtt_subscribe_callback);
 
-    if(mosquitto_connect(mosq, "localhost", 1883, 60))
+    if(mosquitto_connect(mosq, mqttHost.c_str(), mqttPort, 60))
     {
 		fprintf(stderr, "Error: Unable to connect to the MQTT server.\n");
 		return 1;
@@ -384,7 +504,9 @@ int main(int argc, char *argv[])
 
     unique_ptr<AlsaCollectorNode> collector;
     unique_ptr<VepAecBeamformingNode> vep_beam;
-    unique_ptr<Snowboy1bDoaKwsNode> snowboy_kws;
+    unique_ptr<Snowboy1bDoaKwsNode> kws;
+    //unique_ptr<Snips1bDoaKwsNode> kws;
+
 
     collector.reset(AlsaCollectorNode::Create(source, 48000, false));
     vep_beam.reset(VepAecBeamformingNode::Create(MicType::CIRCULAR_6MIC_7BEAM, true, 6, true));
@@ -407,23 +529,21 @@ int main(int argc, char *argv[])
         printf("%d: %s\n", hotwordIndexCount++, (*it).c_str());
     }
 
-    //due to a bug in librespeaker we need to add another sensitivity on here
-    hotwordSensitivitiesString << ",0";
+    //printf("%s\n", hotwordModelString.str().c_str());
+    //printf("%s\n", hotwordSensitivitiesString.str().c_str());
+    //exit(1);
 
-//    printf("%s\n", hotwordModelString.str().c_str());
-//    printf("%s\n", hotwordSensitivitiesString.str().c_str());
-//    exit(1);
-
-    snowboy_kws.reset(Snowboy1bDoaKwsNode::Create("/usr/share/respeaker/snowboy/resources/common.res", hotwordModelString.str().c_str(),hotwordSensitivitiesString.str().c_str()));
+    kws.reset(Snowboy1bDoaKwsNode::Create("/usr/share/respeaker/snowboy/resources/common.res", hotwordModelString.str().c_str(),hotwordSensitivitiesString.str().c_str()));
+    //kws.reset(Snips1bDoaKwsNode::Create("/usr/share/snips/assistant/custom_hotword", 0.5, enable_agc, false));
 
     //Snips deals with notification of the transfer state with its own messages
     //So we can disable the auto transfer states here
-    snowboy_kws->DisableAutoStateTransfer();
-    snowboy_kws->SetDoAecWhenListen(true);
+    kws->DisableAutoStateTransfer();
+    kws->SetDoAecWhenListen(true);
 
     if (enable_agc)
     {
-        snowboy_kws->SetAgcTargetLevelDbfs(agc_level);
+        kws->SetAgcTargetLevelDbfs(agc_level);
         cout << "AGC = -"<< agc_level<< endl;
     }
     else {
@@ -431,22 +551,21 @@ int main(int argc, char *argv[])
     }
 
     vep_beam->Uplink(collector.get());
-    snowboy_kws->Uplink(vep_beam.get());
+    kws->Uplink(vep_beam.get());
 
     respeaker_ptr.reset(ReSpeaker::Create(TRACE_LOG_LEVE));
 
     // collector->SetThreadPriority(50);
     // vep_1beam->SetThreadPriority(99);
-    // snowboy_kws->SetThreadPriority(51);
+    // kws->SetThreadPriority(51);
     //vep_1beam->BindToCore(3);
     //collector->BindToCore(3);
-    //snowboy_kws->BindToCore(2);
+    //kws->BindToCore(2);
 
     respeaker_ptr->RegisterChainByHead(collector.get());
-    respeaker_ptr->RegisterOutputNode(snowboy_kws.get());
-    respeaker_ptr->RegisterDirectionManagerNode(snowboy_kws.get());
-    respeaker_ptr->RegisterHotwordDetectionNode(snowboy_kws.get());
-
+    respeaker_ptr->RegisterOutputNode(kws.get());
+    respeaker_ptr->RegisterDirectionManagerNode(kws.get());
+    respeaker_ptr->RegisterHotwordDetectionNode(kws.get());
 
     if (!respeaker_ptr->Start(&stop))
     {
@@ -462,8 +581,8 @@ int main(int argc, char *argv[])
     cout << "num channels: " << num_channels << ", rate: " << rate << endl;
 
 
-    string framedata;
-    int frames;
+    string framedata_chunk1;
+    string framedata_chunk2;
 
     //Setup the sndfile virtual IO that we use to get wav data to mqtt
     VIO_DATA        vio_data;
@@ -485,8 +604,27 @@ int main(int argc, char *argv[])
 	sfinfo.channels = num_channels;
 	sfinfo.samplerate = rate;
 
+    SF_CHUNK_INFO chunk_time ;
+    memset (&chunk_time, 0, sizeof (chunk_time)) ;
+    snprintf (chunk_time.id, sizeof (chunk_time.id), "time") ;
+    chunk_time.id_size = 4 ;
+    chunk_time.datalen = 8;
+    chunk_time.data = malloc(chunk_time.datalen);
+
+    SF_CHUNK_INFO chunk_replay_request_id ;
+    memset (&chunk_replay_request_id, 0, sizeof (chunk_replay_request_id)) ;
+    snprintf (chunk_replay_request_id.id, sizeof (chunk_replay_request_id.id), "rpid") ;
+    chunk_replay_request_id.id_size = 4 ;
+    chunk_replay_request_id.datalen = 0;
+
+    SF_CHUNK_INFO chunk_replay_remaning_frames ;
+    memset (&chunk_replay_remaning_frames, 0, sizeof (chunk_replay_remaning_frames)) ;
+    snprintf (chunk_replay_remaning_frames.id, sizeof (chunk_replay_remaning_frames.id), "rpfr") ;
+    chunk_replay_remaning_frames.id_size = 4 ;
+    chunk_replay_remaning_frames.datalen = 0;
+
     int tick;
-    int hotword_index = 0, hotword_count = 0;
+    int hotword_index = 0, hotword_trigger_count = 0;
     int dir = 0;
     bool vad_status = false;
 
@@ -495,6 +633,10 @@ int main(int argc, char *argv[])
     bool physicalButtonTrigger = false;
     uint16_t previousPhysicalButtonValue = 0;
 
+    uint64_t lasttimestamp = timeSinceEpochMillisec();
+
+    uint64_t averagedifftotal = 0;
+    uint64_t averagediffcount = 0;
     while (!stop)
     {
         ChainSharedData *chainstateData = respeaker_ptr->GetChainSharedDataPtr();
@@ -529,48 +671,14 @@ int main(int argc, char *argv[])
             } while (rc == 0 && eveventcount < 20);
         }
 
-        //Process any audio data thats inflight
-        framedata = respeaker_ptr->DetectHotword(hotword_index);
-        //vad_status = respeaker_ptr->GetVad();
-
-        //printf("framedata length: %d\n", framedata.length());
-        //Sort out what mode we are in and what we have to do based on that mode
-        if (chainstateData && (chainstateData->state == ChainState::LISTEN_QUIETLY || chainstateData->state == ChainState::LISTEN_WITH_BGM))
+        if (chainstateData && (chainstateData->state == ChainState::WAIT_TRIGGER_QUIETLY || chainstateData->state == ChainState::WAIT_TRIGGER_WITH_BGM))
         {
-            //We are listening to the user speaking.  Lets just forward this audio on to mqtt for asr processing.
-            ////TODO: Check VAD and stop if we no longer have active voice detection
-            //printf("Vad status:%d\n", vad_status);
+            //Check to see if we have any hotword triggered
+            hotword_index = respeaker_ptr->DetectHotword();
 
-            //Write out our audio data into the wav container.
-            frames = framedata.length() / (sizeof(int16_t) * num_channels);
-
-            //reset the buffer we use for the wav data
-            vio_data.offset = 0;
-	        vio_data.length = 0;
-
-            //Open up our virtual file that we use to to sort out the raw sound data
-            //and get it into a format that snips wants
-            if ((sndfile = sf_open_virtual (&vio, SFM_WRITE, &sfinfo, &vio_data)) == NULL)
+            if (hotword_index > 0 || physicalButtonTrigger)
             {
-                printf ("\n\nLine %d : sf_open_write failed with error : ", __LINE__) ;
-                fflush (stdout) ;
-                puts (sf_strerror (NULL)) ;
-                exit (1) ;
-            };
-
-            sf_writef_short(sndfile, (const int16_t *)(framedata.data()), frames);
-            sf_close(sndfile);
-
-            //push the message to MQTT
-            mosquitto_publish(mosq, NULL, audioFrameTopic.str().c_str(), vio_data.length, vio_data.data, 2, false);
-
-        }
-        else if (chainstateData && (chainstateData->state == ChainState::WAIT_TRIGGER_QUIETLY || chainstateData->state == ChainState::WAIT_TRIGGER_WITH_BGM))
-        {
-            //We are waiting for our trigger so lets check to see if one occured and process as required
-             if (hotword_index >= 1 || physicalButtonTrigger)
-            {
-                bool bailout = false;
+                bool bailoutAndIgnore = false;
                 std::string hotwordId = "default";
                 //Hotword has been detected (or the physical button was pushed).  Time to notify snips
                 if (physicalButtonTrigger)
@@ -585,7 +693,7 @@ int main(int argc, char *argv[])
                     if (chainstateData && (chainstateData->state == ChainState::LISTEN_QUIETLY || chainstateData->state == ChainState::LISTEN_WITH_BGM))
                     {
                         //We have already had a hotword (or physical button) trigger.  So just bail out
-                        bailout = true;
+                        bailoutAndIgnore = true;
                     }
                 }
                 else
@@ -593,7 +701,7 @@ int main(int argc, char *argv[])
                     //When trigged by the hotword engine we can fetch the DOA
                     dir = respeaker_ptr->GetDirection();
 
-                    //TODO: sort out the wakeword that was used and reflect that.
+                    //Sort out the wakeword that was used and reflect that.
                     int activatedHotwordIndex = hotword_index - 1;
                     if (activatedHotwordIndex < hotword_models.size())
                     {
@@ -605,7 +713,7 @@ int main(int argc, char *argv[])
                     }
                 }
 
-                if (!bailout)
+                if (!bailoutAndIgnore)
                 {
                     //We build this up manually since snips apparenly needs the json in a specific order to function
                     std::stringstream payload;
@@ -621,11 +729,11 @@ int main(int argc, char *argv[])
                     std::stringstream topic;
                     topic << "hermes/hotword/" << hotwordId << "/detected";
 
-                    //push the message to MQTT
+                    //push the hotword activation message to MQTT
                     mosquitto_publish(mosq, NULL, topic.str().c_str(), payload.str().length(), payload.str().c_str(), 2, false);
 
-                    hotword_count++;
-                    cout << "hotword: " << hotwordId << ", direction: " << dir << ", hotword_count = " << hotword_count << endl;
+                    hotword_trigger_count++;
+                    cout << "hotword: " << hotwordId << ", direction: " << dir << ", hotword_count = " << hotword_trigger_count << endl;
 
                     //Switch the chain to the listen mode
                     respeaker_ptr->SetChainState(ChainState::LISTEN_QUIETLY);
@@ -633,9 +741,151 @@ int main(int argc, char *argv[])
             }
         }
 
-        if (tick++ % 20 == 0)
+        //lets process audio data
+
+        //We get data from librespeaker in chunks of 1280 bytes (which corresponds to 640 audio frames)
+        //We need to send it to snips in 512 byte chunks (256 audio frames)
+        //So to do that we ask librespeaker for data twice to get a total of 2560 bytes (1280 audio frames)
+        //Which we can then split up into 5 audio frames and send along at the proper size
+        uint64_t timestamp_chunk1 = timeSinceEpochMillisec();
+        framedata_chunk1 = respeaker_ptr->Listen();
+        const int16_t *framedata_chunk1_pointer = (const int16_t *)(framedata_chunk1.data());
+        //char *framedataPointer_tmp = (char *)malloc(2560); //(const int16_t *)(framedata.data());
+        //memset(framedataPointer_tmp, 1, 1280);
+        /*char counter = 0;
+        for (int g = 0; g < 1280; g++)
         {
-            std::cout << "collector: " << collector->GetQueueDeepth() << ", vep_beam: " << vep_beam->GetQueueDeepth() << ", snowboy_kws: " << snowboy_kws->GetQueueDeepth() << std::endl;
+            framedataPointer_tmp[g] = counter++;
+        }*/
+        //const int16_t *framedata_chunk1_pointer = (const int16_t *)framedataPointer_tmp;
+
+
+
+        uint64_t timestamp_chunk2 = timeSinceEpochMillisec();
+        framedata_chunk2 = respeaker_ptr->Listen();
+        const int16_t *framedata_chunk2_pointer = (const int16_t *)(framedata_chunk2.data());
+        //char *framedataPointer2_tmp = (char *)malloc(2560); //(const int16_t *)(framedata.data());
+        //memset(framedataPointer2_tmp, 2, 1280);
+        /*counter = 0;
+        for (int g = 0; g < 1280; g++)
+        {
+            framedataPointer2_tmp[g] = counter++;
+        }*/
+        //const int16_t *framedata_chunk2_pointer = (const int16_t *)framedataPointer2_tmp;
+
+
+        int framesProcessed = 0;
+
+        int bytesToProcess = framedata_chunk1.length() + framedata_chunk2.length();
+        if (bytesToProcess == 2560)
+        {
+            int packetCount = 0;
+            while (bytesToProcess > 0)
+            {
+                uint64_t datatimestamp = 0;
+                //reset the buffer we use for the wav data
+                vio_data.offset = 0;
+                vio_data.length = 0;
+
+                if ((sndfile = sf_open_virtual (&vio, SFM_WRITE, &sfinfo, &vio_data)) == NULL)
+                {
+                    printf ("\n\nLine %d : sf_open_write failed with error : ", __LINE__) ;
+                    fflush (stdout) ;
+                    puts (sf_strerror (NULL)) ;
+                    exit (1) ;
+                };
+
+                if (framesProcessed < 512)
+                {
+                    //Audio packet #1 and #2
+                    if (framesProcessed == 0)
+                    {
+                        //Timestamp for packet 1 is timestamp_chunk1
+                        //nothing to do as the timestamp is the base
+                    }
+                    else
+                    {
+                        //Timestamp for packet 2 is timestamp_chunk1 + 8ms
+                        timestamp_chunk1 += 8;
+                    }
+
+                    datatimestamp = timestamp_chunk1;
+                    memcpy(chunk_time.data, &timestamp_chunk1, chunk_time.datalen);
+                    //write out the extra meta data
+                    sf_set_chunk(sndfile, &chunk_time);
+
+                    //Data comes from first chunk
+                    sf_writef_short(sndfile, framedata_chunk1_pointer + framesProcessed, 256);
+                }
+                else if (framesProcessed == 512)
+                {
+                    //Audio packet #3
+                    //Timestamp comes from timestamp_chunk1 and is 8ms after packet 2.
+                    timestamp_chunk1 += 8;
+                    datatimestamp = timestamp_chunk1;
+                    memcpy(chunk_time.data, &timestamp_chunk1, chunk_time.datalen);
+                    //write out the extra meta data
+                    sf_set_chunk(sndfile, &chunk_time);
+
+                    //Data come from first and second chunk
+                    sf_writef_short(sndfile, framedata_chunk1_pointer + framesProcessed, 128);
+                    sf_writef_short(sndfile, framedata_chunk2_pointer + (framesProcessed - 512), 128);
+                }
+                else if (framesProcessed > 512)
+                {
+                    //Audio packet #4 and #5
+                    if (framesProcessed == 768)
+                    {
+                        //Timestamp for packet 4 is based on timestamp_chunk2 but it is 4ms in the future (since we have half a packet in packet 3)
+                        timestamp_chunk2 += 4;
+                    }
+                    else
+                    {
+                        //Timestamp for packet 5 is 8ms after packet 4
+                        timestamp_chunk2 += 8;
+                    }
+                    datatimestamp = timestamp_chunk2;
+                    memcpy(chunk_time.data, &timestamp_chunk2, chunk_time.datalen);
+                    //write out the extra meta data
+                    sf_set_chunk(sndfile, &chunk_time);
+
+                    //Data comes from second chunk
+                    sf_writef_short(sndfile, framedata_chunk2_pointer + (framesProcessed - 640), 256);
+                }
+
+                //Every loop through we have processed 512 bytes (256 audio frames)
+                bytesToProcess -= 512;
+                framesProcessed += 256;
+
+                //Close up the virtual file so we can use that data to send to mqtt
+                sf_close(sndfile);
+
+                //Stuff the data in our circular buffer based on the timestamp for replay
+                //TODO
+                //storeBuffer(datatimestamp, vio_data.data, vio_data.length);
+
+                //Debug output
+                //printf("Packet #%d------------------\n", ++packetCount);
+                //hexDump(vio_data.data, vio_data.length);
+
+                //if we are supposed to be sending this audio data along then do so
+                //We only send to MQTT when we have been triggered by a hotword or physical button push.  That way
+                //we aren't sending tons of data over the network if the mqtt server is remote
+                if (chainstateData && (chainstateData->state == ChainState::LISTEN_QUIETLY || chainstateData->state == ChainState::LISTEN_WITH_BGM))
+                {
+                    //Send the data to MQTT
+                    mosquitto_publish(mosq, NULL, audioFrameTopic.str().c_str(), vio_data.length, vio_data.data, 2, false);
+                }
+            }
+        }
+        else
+        {
+            //we didn't get enough data from librespeaker.  For now we'll ignore this and maybe make it an error later
+        }
+
+        if (tick++ % 10 == 0)
+        {
+            std::cout << "collector: " << collector->GetQueueDeepth() << ", vep_beam: " << vep_beam->GetQueueDeepth() << ", kws: " << kws->GetQueueDeepth() << std::endl;
         }
     }
 
@@ -645,6 +895,8 @@ int main(int argc, char *argv[])
 
     //Clean up the libevdev descriptor
     close(fd);
+
+    free(chunk_time.data); chunk_time.data = NULL;
 
     //Cleanup the mqtt connection
     mosquitto_loop_stop(mosq, true);
