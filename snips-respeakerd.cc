@@ -32,7 +32,6 @@ extern "C"
 
 #define TOGGLEHOTWORDONTOPIC "hermes/hotword/toggleOn"
 #define TOGGLEHOTWORDOFFTOPIC "hermes/hotword/toggleOff"
-#define OUTPUTACTIVETOPIC "respeakercorev2d/outputactive"
 
 
 const char *hotword_model_path = "./hotword_models/";
@@ -193,10 +192,6 @@ void mqtt_message_callback(struct mosquitto *mosq, void *userdata, const struct 
         {
             hotwordToggleOffCommand = true;
         }
-        else if (strncasecmp(OUTPUTACTIVETOPIC, message->topic, messageTopicLength) == 0)
-        {
-            //TODO: deal with switching to and from the BGM modes of listening/triggering
-        }
         else
         {
             //Unknown topic.
@@ -257,10 +252,6 @@ void mqtt_connect_callback(struct mosquitto *mosq, void *userdata, int result)
 		mosquitto_subscribe(mosq, NULL, TOGGLEHOTWORDONTOPIC, 2);
         mosquitto_subscribe(mosq, NULL, TOGGLEHOTWORDOFFTOPIC, 2);
         printf("Subscribed to hotword control topics\n");
-
-        //subscribe to media playback messages (for third party notifications of audio being output)
-        mosquitto_subscribe(mosq, NULL, OUTPUTACTIVETOPIC, 2);
-        printf("Subscribed to 3d party media playback messages\n");
 	}
     else
     {
@@ -509,7 +500,7 @@ int main(int argc, char *argv[])
 
 
     collector.reset(AlsaCollectorNode::Create(source, 48000, false));
-    vep_beam.reset(VepAecBeamformingNode::Create(MicType::CIRCULAR_6MIC_7BEAM, true, 6, true));
+    vep_beam.reset(VepAecBeamformingNode::Create(MicType::CIRCULAR_6MIC_7BEAM, true, 6, false));
 
     //build up our model string and sensitivities string
     std::stringstream hotwordModelString;
